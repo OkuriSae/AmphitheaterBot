@@ -1,0 +1,7 @@
+.env
+*.json
+.amphitheaterbot.lock
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
