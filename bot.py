@@ -1,6 +1,5 @@
 import asyncio
 import csv
-import fcntl
 import io
 import itertools
 import logging
@@ -10,6 +9,12 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
 
 import certifi
 import truststore
@@ -51,8 +56,6 @@ MAP_POLL_OPTIONS = [
     ("⛰️", "ハイランド"),
     ("🧊", "地軸傾斜"),
 ]
-END_TURN_POLL_QUESTION = "終了ターン"
-END_TURN_POLL_OPTIONS = ["100T", "No Limit"]
 THREAD_NAME_MAX_LENGTH = 100
 TEAM_EMBED_TITLE = "チーム分け"
 TEAM_1_FIELD_PREFIX = "チーム1"
@@ -62,11 +65,19 @@ RATINGS_SPREADSHEET_ID = "13__lGAuvm00wKJeZro8hGpy9PsulrCHvDiCVxdly7qU"
 RATINGS_WORKSHEET_GID = 0
 PLAYER_LIST_SHEET_TITLE = "プレイヤーリスト"
 DEFAULT_RATING = "1000"
-ELO_K_FACTOR = 32
+ELO_K_FACTOR = 48
 TIMEZONE = ZoneInfo("Asia/Tokyo")
 RATINGS_CSV_URL = os.getenv(
     "RATINGS_CSV_URL",
     f"https://docs.google.com/spreadsheets/d/{RATINGS_SPREADSHEET_ID}/export?format=csv&gid={RATINGS_WORKSHEET_GID}",
+)
+MEMBER_LIST_URL = os.getenv(
+    "MEMBER_LIST_URL",
+    f"https://docs.google.com/spreadsheets/d/{RATINGS_SPREADSHEET_ID}/edit#gid={RATINGS_WORKSHEET_GID}",
+)
+RESULT_TABLE_URL = os.getenv(
+    "RESULT_TABLE_URL",
+    f"https://docs.google.com/spreadsheets/d/{RATINGS_SPREADSHEET_ID}/edit?gid=510962199#gid=510962199",
 )
 LATEST_TEAMS_BY_CHANNEL: dict[int, tuple[list["Participant"], list["Participant"]]] = {}
 BATTLE_STATES_BY_THREAD: dict[int, "BattleState"] = {}
@@ -86,9 +97,8 @@ class Participant:
 @dataclass
 class BattleState:
     parent_channel_id: int
-    thread_id: int
+    map_poll_channel_id: int
     map_poll_message_id: int
-    end_turn_poll_message_id: int
     team_1: list[Participant] | None = None
     team_2: list[Participant] | None = None
 
@@ -117,6 +127,16 @@ class RatingRegistrationError(Exception):
 
 class FinishError(Exception):
     pass
+
+
+def acquire_process_lock(lock_file) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except (BlockingIOError, OSError) as exc:
+        raise RuntimeError("Another AmphitheaterBot process is already running.") from exc
 
 
 def rating_value(participant: Participant) -> int:
@@ -189,6 +209,14 @@ def update_participants(embed: discord.Embed, participants: list[Participant]) -
     embed.add_field(name=PARTICIPANTS_FIELD_NAME, value=value, inline=False)
 
 
+def add_member_list_link(embed: discord.Embed) -> None:
+    embed.add_field(name="メンバーリスト", value=f"[開く]({MEMBER_LIST_URL})", inline=False)
+
+
+def add_result_table_link(embed: discord.Embed) -> None:
+    embed.add_field(name="結果表", value=f"[開く]({RESULT_TABLE_URL})", inline=False)
+
+
 async def edit_interaction_message(
     interaction: discord.Interaction,
     *,
@@ -240,14 +268,6 @@ def create_map_poll() -> discord.Poll:
     return poll
 
 
-def create_end_turn_poll() -> discord.Poll:
-    poll = discord.Poll(question=END_TURN_POLL_QUESTION, duration=MAP_POLL_DURATION, multiple=False)
-    for label in END_TURN_POLL_OPTIONS:
-        poll.add_answer(text=label)
-
-    return poll
-
-
 def create_battle_thread_name(title: str) -> str:
     suffix = " 投票"
     max_title_length = THREAD_NAME_MAX_LENGTH - len(suffix)
@@ -278,7 +298,8 @@ def format_team(participants: list[Participant]) -> str:
         return "なし"
 
     lines = []
-    for index, participant in enumerate(participants, start=1):
+    sorted_participants = sorted(participants, key=lambda participant: (rating_value(participant), participant.user_id))
+    for index, participant in enumerate(sorted_participants, start=1):
         rating = participant.rating if participant.rating else "未登録"
         lines.append(f"{index}. <@{participant.user_id}> ({rating})")
 
@@ -482,8 +503,11 @@ def get_spreadsheet():
 
     import gspread
 
-    client = gspread.service_account(filename=service_account_file)
-    return client.open_by_key(RATINGS_SPREADSHEET_ID)
+    try:
+        client = gspread.service_account(filename=service_account_file)
+        return client.open_by_key(RATINGS_SPREADSHEET_ID)
+    except Exception as exc:
+        raise FinishError(f"スプレッドシートへの接続に失敗しました: {exc}") from exc
 
 
 def get_worksheet_by_title(title: str):
@@ -513,7 +537,6 @@ def load_rating_rows() -> tuple[object, list[str], list[dict[str, str]]]:
 def update_rating_row(player_keys: list[str], new_rating: int) -> None:
     worksheet, headers, rows = load_rating_rows()
     normalized_keys = {normalize_rating_key(key) for key in player_keys}
-    user_id_column = headers.index("userid") + 1
     rating_column = headers.index("rating") + 1
 
     for row in rows:
@@ -524,18 +547,80 @@ def update_rating_row(player_keys: list[str], new_rating: int) -> None:
     worksheet.append_row([player_keys[0], str(new_rating)], value_input_option="USER_ENTERED")
 
 
+def column_label(column_number: int) -> str:
+    label = ""
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        label = chr(65 + remainder) + label
+    return label
+
+
+def update_rating_rows(rating_updates: list[tuple[list[str], int]]) -> None:
+    if not rating_updates:
+        return
+
+    worksheet, headers, rows = load_rating_rows()
+    rating_column = headers.index("rating") + 1
+    rating_column_label = column_label(rating_column)
+    rows_by_user_id = {normalize_rating_key(row.get("userid", "")): row for row in rows}
+
+    batch_updates = []
+    rows_to_append = []
+    for player_keys, new_rating in rating_updates:
+        normalized_keys = [normalize_rating_key(key) for key in player_keys]
+        matched_row = next((rows_by_user_id[key] for key in normalized_keys if key in rows_by_user_id), None)
+        if matched_row is None:
+            rows_to_append.append([player_keys[0], str(new_rating)])
+            continue
+
+        row_number = int(matched_row["_row_number"])
+        batch_updates.append(
+            {
+                "range": f"{rating_column_label}{row_number}",
+                "values": [[str(new_rating)]],
+            }
+        )
+
+    if batch_updates:
+        worksheet.batch_update(batch_updates, value_input_option="USER_ENTERED")
+
+    if rows_to_append:
+        worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+
+
 def append_row_by_headers(sheet_title: str, row: dict[str, object]) -> None:
+    append_rows_by_headers(sheet_title, [row])
+
+
+def append_rows_by_headers(sheet_title: str, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+
     worksheet = get_worksheet_by_title(sheet_title)
     values = worksheet.get_all_values()
     if not values:
         raise FinishError(f"「{sheet_title}」シートにヘッダー行がありません。")
 
     headers = values[0]
-    before_rows = len(values)
-    worksheet.append_row([str(row.get(header, "")) for header in headers], value_input_option="USER_ENTERED")
-    after_rows = len(worksheet.get_all_values())
-    if after_rows <= before_rows:
-        raise FinishError(f"「{sheet_title}」シートへの追記を確認できませんでした。")
+    worksheet.append_rows(
+        [[str(row.get(header, "")) for header in headers] for row in rows],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def write_finish_rows_to_sheets(
+    team_row: dict[str, object],
+    personal_rows: list[dict[str, object]],
+    rating_updates: list[tuple[list[str], int]],
+) -> None:
+    try:
+        append_row_by_headers("対戦結果_チーム", team_row)
+        append_rows_by_headers("対戦結果_個人", personal_rows)
+        update_rating_rows(rating_updates)
+    except FinishError:
+        raise
+    except Exception as exc:
+        raise FinishError(f"対戦結果のスプレッドシート更新に失敗しました: {exc}") from exc
 
 
 def winning_text(winner: int) -> str:
@@ -577,7 +662,7 @@ def format_rating_delta(old_rating: int, new_rating: int) -> str:
 def format_team_result_rows(result: FinishResult, team_name: str) -> str:
     rows = [
         f"{player.player_name}: {player.new_rating} ({format_rating_delta(player.old_rating, player.new_rating)})"
-        for player in result.player_results
+        for player in sorted(result.player_results, key=lambda player: (player.old_rating, player.player_name.lower()))
         if player.team_name == team_name
     ]
     return "\n".join(rows) if rows else "なし"
@@ -587,9 +672,9 @@ def create_finish_embed(result: FinishResult) -> discord.Embed:
     embed = discord.Embed(title="対戦結果", color=discord.Color.blue())
     embed.add_field(name="勝敗", value=result.winner_text, inline=False)
     embed.add_field(name="マップ", value=result.map_name, inline=False)
-    embed.add_field(name="終了ターン", value=result.end_turn, inline=False)
     embed.add_field(name="チーム1", value=format_team_result_rows(result, "チーム1"), inline=False)
     embed.add_field(name="チーム2", value=format_team_result_rows(result, "チーム2"), inline=False)
+    add_result_table_link(embed)
 
     return embed
 
@@ -609,26 +694,26 @@ async def participant_names(participants: list[Participant]) -> dict[int, str]:
     return names
 
 
-async def fetch_thread_for_state(interaction: discord.Interaction, state: BattleState) -> discord.Thread:
+async def fetch_map_poll_channel(interaction: discord.Interaction, state: BattleState) -> discord.abc.Messageable:
     channel = interaction.channel
-    if isinstance(channel, discord.Thread) and channel.id == state.thread_id:
+    if channel is not None and interaction.channel_id == state.map_poll_channel_id:
         return channel
 
     guild = interaction.guild
     if guild is not None:
-        thread = guild.get_thread(state.thread_id)
-        if thread is not None:
-            return thread
+        channel = guild.get_channel_or_thread(state.map_poll_channel_id)
+        if channel is not None:
+            return channel
 
-    fetched = await bot.fetch_channel(state.thread_id)
-    if not isinstance(fetched, discord.Thread):
-        raise FinishError("投票スレッドを取得できませんでした。")
+    fetched = await bot.fetch_channel(state.map_poll_channel_id)
+    if not hasattr(fetched, "fetch_message"):
+        raise FinishError("マップ投票チャンネルを取得できませんでした。")
 
     return fetched
 
 
-async def poll_top_options(thread: discord.Thread, message_id: int) -> tuple[str | None, list[str]]:
-    message = await thread.fetch_message(message_id)
+async def poll_top_options(channel: discord.abc.Messageable, message_id: int) -> tuple[str | None, list[str]]:
+    message = await channel.fetch_message(message_id)
     poll = message.poll
     if poll is None:
         raise FinishError("Pollメッセージを読み取れませんでした。")
@@ -648,11 +733,9 @@ async def poll_top_options(thread: discord.Thread, message_id: int) -> tuple[str
 async def collect_poll_results(
     interaction: discord.Interaction,
     state: BattleState,
-) -> tuple[str | None, list[str], str | None, list[str]]:
-    thread = await fetch_thread_for_state(interaction, state)
-    map_result, map_ties = await poll_top_options(thread, state.map_poll_message_id)
-    end_turn_result, end_turn_ties = await poll_top_options(thread, state.end_turn_poll_message_id)
-    return map_result, map_ties, end_turn_result, end_turn_ties
+) -> tuple[str | None, list[str]]:
+    channel = await fetch_map_poll_channel(interaction, state)
+    return await poll_top_options(channel, state.map_poll_message_id)
 
 
 async def write_finish_results(
@@ -673,18 +756,14 @@ async def write_finish_results(
     team_2_name_list = [all_names[participant.user_id] for participant in team_2]
     team_1_names = "/".join(team_1_name_list)
     team_2_names = "/".join(team_2_name_list)
-
-    append_row_by_headers(
-        "対戦結果_チーム",
-        {
-            "対戦日（決着日時）": finished_at,
-            "マップ": map_name,
-            "終了ターン": end_turn,
-            "チーム１": team_1_names,
-            "チーム２": team_2_names,
-            "結果": result_text,
-        },
-    )
+    team_row = {
+        "対戦日（決着日時）": finished_at,
+        "マップ": map_name,
+        "終了ターン": end_turn,
+        "チーム１": team_1_names,
+        "チーム２": team_2_names,
+        "結果": result_text,
+    }
 
     team_1_average = average_rating(team_1)
     team_2_average = average_rating(team_2)
@@ -721,12 +800,12 @@ async def write_finish_results(
             )
             rating_updates.append(([player_name, str(participant.user_id)], new_rating))
 
-    for row in personal_rows:
-        append_row_by_headers("対戦結果_個人", row)
-
-    if winner != 0:
-        for player_keys, new_rating in rating_updates:
-            update_rating_row(player_keys, new_rating)
+    await asyncio.to_thread(
+        write_finish_rows_to_sheets,
+        team_row,
+        personal_rows,
+        rating_updates if winner != 0 else [],
+    )
 
     return FinishResult(
         winner_text=result_text,
@@ -883,20 +962,15 @@ class FinishSelectionView(discord.ui.View):
         state: BattleState,
         map_result: str | None,
         map_ties: list[str],
-        end_turn_result: str | None,
-        end_turn_ties: list[str],
     ) -> None:
         super().__init__(timeout=300)
         self.requester_id = requester_id
         self.winner = winner
         self.state = state
         self.map_result = map_result
-        self.end_turn_result = end_turn_result
 
         if map_ties:
             self.add_item(TieSelect("マップ", "map", map_ties))
-        if end_turn_ties:
-            self.add_item(TieSelect("終了ターン", "end_turn", end_turn_ties))
 
         self.add_item(FinishConfirmButton())
 
@@ -911,8 +985,6 @@ class FinishSelectionView(discord.ui.View):
         missing = []
         if self.map_result is None:
             missing.append("マップ")
-        if self.end_turn_result is None:
-            missing.append("終了ターン")
         if missing:
             await interaction.response.send_message(f"{'、'.join(missing)}を選択してから確定してください。", ephemeral=True)
             return
@@ -926,7 +998,7 @@ class FinishSelectionView(discord.ui.View):
                 winner=self.winner,
                 state=self.state,
                 map_name=self.map_result,
-                end_turn=self.end_turn_result,
+                end_turn="",
             )
         except FinishError as exc:
             await interaction.followup.send(f"対戦結果の記録に失敗しました: {exc}", ephemeral=True)
@@ -954,8 +1026,6 @@ class TieSelect(discord.ui.Select):
 
         if self.target == "map":
             view.map_result = self.values[0]
-        else:
-            view.end_turn_result = self.values[0]
 
         await interaction.response.defer()
 
@@ -1051,6 +1121,7 @@ async def battle(interaction: discord.Interaction, name: str | None = None) -> N
 
     participants = [Participant(user_id=interaction.user.id, rating=owner_rating)]
     update_participants(embed, participants)
+    add_member_list_link(embed)
     role_id = get_battle_role_id(interaction.guild_id)
     role = interaction.guild.get_role(role_id) if interaction.guild is not None else None
     if role is None:
@@ -1075,38 +1146,28 @@ async def battle(interaction: discord.Interaction, name: str | None = None) -> N
                 Participant(participant.user_id, participant.rating) for participant in participants
             ]
 
-        thread_name = create_battle_thread_name(title)
-        try:
-            thread = await battle_message.create_thread(name=thread_name)
-        except discord.Forbidden:
-            logging.exception(
-                "Failed to create a thread from the battle message. %s",
-                describe_bot_thread_permissions(interaction),
-            )
-            if isinstance(interaction.channel, discord.TextChannel):
-                thread = await interaction.channel.create_thread(name=thread_name)
-            else:
-                raise
-        map_poll_message = await thread.send(poll=create_map_poll())
-        end_turn_poll_message = await thread.send(poll=create_end_turn_poll())
+        if interaction.channel is None:
+            await interaction.followup.send("マップ投票を投稿するチャンネルを取得できませんでした。", ephemeral=True)
+            return
+
+        map_poll_message = await interaction.channel.send(poll=create_map_poll())
         if interaction.channel_id is not None:
-            THREAD_IDS_BY_PARENT_CHANNEL[interaction.channel_id] = thread.id
-            BATTLE_STATES_BY_THREAD[thread.id] = BattleState(
+            THREAD_IDS_BY_PARENT_CHANNEL[interaction.channel_id] = interaction.channel_id
+            BATTLE_STATES_BY_THREAD[interaction.channel_id] = BattleState(
                 parent_channel_id=interaction.channel_id,
-                thread_id=thread.id,
+                map_poll_channel_id=interaction.channel_id,
                 map_poll_message_id=map_poll_message.id,
-                end_turn_poll_message_id=end_turn_poll_message.id,
             )
     except discord.Forbidden:
         permission_summary = describe_bot_thread_permissions(interaction)
         await interaction.followup.send(
-            "募集メッセージのスレッド作成、または投票投稿に必要な権限がありません。\n"
+            "マップ投票の投稿に必要な権限がありません。\n"
             f"{permission_summary}",
             ephemeral=True,
         )
     except discord.HTTPException:
         logging.exception("Failed to create a battle thread or send the map poll.")
-        await interaction.followup.send("スレッド作成またはマップ投票の投稿に失敗しました。", ephemeral=True)
+        await interaction.followup.send("マップ投票の投稿に失敗しました。", ephemeral=True)
 
 
 @bot.tree.command(name="remove", description="募集参加者から指定ユーザーを除外します")
@@ -1276,20 +1337,18 @@ async def finish(interaction: discord.Interaction, winner: int) -> None:
         return
 
     try:
-        map_result, map_ties, end_turn_result, end_turn_ties = await collect_poll_results(interaction, state)
+        map_result, map_ties = await collect_poll_results(interaction, state)
     except (discord.Forbidden, discord.NotFound, FinishError) as exc:
         await interaction.followup.send(f"投票結果の取得に失敗しました: {exc}", ephemeral=True)
         return
 
-    if map_ties or end_turn_ties:
+    if map_ties:
         view = FinishSelectionView(
             requester_id=interaction.user.id,
             winner=winner_value,
             state=state,
             map_result=map_result,
             map_ties=map_ties,
-            end_turn_result=end_turn_result,
-            end_turn_ties=end_turn_ties,
         )
         await interaction.followup.send("同票の投票項目があります。記録に使う項目を選択してください。", view=view, ephemeral=True)
         return
@@ -1299,7 +1358,7 @@ async def finish(interaction: discord.Interaction, winner: int) -> None:
             winner=winner_value,
             state=state,
             map_name=map_result or "",
-            end_turn=end_turn_result or "",
+            end_turn="",
         )
     except FinishError as exc:
         await interaction.followup.send(f"対戦結果の記録に失敗しました: {exc}", ephemeral=True)
@@ -1313,10 +1372,7 @@ def main() -> None:
     global LOCK_FILE
 
     LOCK_FILE = open(LOCK_FILE_PATH, "w")
-    try:
-        fcntl.flock(LOCK_FILE, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        raise RuntimeError("Another AmphitheaterBot process is already running.") from exc
+    acquire_process_lock(LOCK_FILE)
 
     token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:

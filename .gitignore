@@ -1,4 +1,6 @@
 .env
+env
+*.log
 *.json
 .amphitheaterbot.lock
 .venv/
