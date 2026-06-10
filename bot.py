@@ -66,6 +66,8 @@ RATINGS_WORKSHEET_GID = 0
 PLAYER_LIST_SHEET_TITLE = "プレイヤーリスト"
 DEFAULT_RATING = "1000"
 ELO_K_FACTOR = 48
+TEAM_AVERAGE_RATING_WEIGHT = 0.7
+PERSONAL_RATING_WEIGHT = 0.3
 TIMEZONE = ZoneInfo("Asia/Tokyo")
 RATINGS_CSV_URL = os.getenv(
     "RATINGS_CSV_URL",
@@ -105,6 +107,7 @@ class BattleState:
 
 @dataclass
 class PlayerResult:
+    user_id: int
     player_name: str
     team_name: str
     old_rating: int
@@ -210,11 +213,11 @@ def update_participants(embed: discord.Embed, participants: list[Participant]) -
 
 
 def add_member_list_link(embed: discord.Embed) -> None:
-    embed.add_field(name="メンバーリスト", value=f"[開く]({MEMBER_LIST_URL})", inline=False)
+    embed.add_field(name="\u200b", value=f"[メンバーリスト]({MEMBER_LIST_URL})", inline=False)
 
 
 def add_result_table_link(embed: discord.Embed) -> None:
-    embed.add_field(name="結果表", value=f"[開く]({RESULT_TABLE_URL})", inline=False)
+    embed.add_field(name="\u200b", value=f"[結果表]({RESULT_TABLE_URL})", inline=False)
 
 
 async def edit_interaction_message(
@@ -298,7 +301,7 @@ def format_team(participants: list[Participant]) -> str:
         return "なし"
 
     lines = []
-    sorted_participants = sorted(participants, key=lambda participant: (rating_value(participant), participant.user_id))
+    sorted_participants = sorted(participants, key=lambda participant: (-rating_value(participant), participant.user_id))
     for index, participant in enumerate(sorted_participants, start=1):
         rating = participant.rating if participant.rating else "未登録"
         lines.append(f"{index}. <@{participant.user_id}> ({rating})")
@@ -643,8 +646,10 @@ def expected_score(player_rating: int, opponent_rating: int) -> float:
     return 1 / (1 + 10 ** ((opponent_rating - player_rating) / 400))
 
 
-def calculate_new_rating(player_rating: int, opponent_rating: int, score: float) -> int:
-    return round(player_rating + ELO_K_FACTOR * (score - expected_score(player_rating, opponent_rating)))
+def calculate_blended_rating_delta(player_rating: int, team_rating: int, opponent_rating: int, score: float) -> int:
+    team_delta = ELO_K_FACTOR * (score - expected_score(team_rating, opponent_rating))
+    personal_delta = ELO_K_FACTOR * (score - expected_score(player_rating, opponent_rating))
+    return round(team_delta * TEAM_AVERAGE_RATING_WEIGHT + personal_delta * PERSONAL_RATING_WEIGHT)
 
 
 def average_rating(participants: list[Participant]) -> int:
@@ -661,8 +666,8 @@ def format_rating_delta(old_rating: int, new_rating: int) -> str:
 
 def format_team_result_rows(result: FinishResult, team_name: str) -> str:
     rows = [
-        f"{player.player_name}: {player.new_rating} ({format_rating_delta(player.old_rating, player.new_rating)})"
-        for player in sorted(result.player_results, key=lambda player: (player.old_rating, player.player_name.lower()))
+        f"<@{player.user_id}>: {player.new_rating} ({format_rating_delta(player.old_rating, player.new_rating)})"
+        for player in sorted(result.player_results, key=lambda player: (-player.old_rating, player.player_name.lower()))
         if player.team_name == team_name
     ]
     return "\n".join(rows) if rows else "なし"
@@ -677,6 +682,15 @@ def create_finish_embed(result: FinishResult) -> discord.Embed:
     add_result_table_link(embed)
 
     return embed
+
+
+async def send_finish_embed(interaction: discord.Interaction, result: FinishResult) -> None:
+    embed = create_finish_embed(result)
+    if interaction.channel is not None:
+        await interaction.channel.send(embed=embed)
+        return
+
+    await interaction.followup.send(embed=embed)
 
 
 async def participant_names(participants: list[Participant]) -> dict[int, str]:
@@ -772,13 +786,14 @@ async def write_finish_results(
     personal_rows = []
     player_results: list[PlayerResult] = []
     rating_updates: list[tuple[list[str], int]] = []
-    for team_name, participants, opponent_average, score in [
-        ("チーム1", team_1, team_2_average, score_by_team[0]),
-        ("チーム2", team_2, team_1_average, score_by_team[1]),
+    for team_name, participants, team_average, opponent_average, score in [
+        ("チーム1", team_1, team_1_average, team_2_average, score_by_team[0]),
+        ("チーム2", team_2, team_2_average, team_1_average, score_by_team[1]),
     ]:
         for participant in participants:
             old_rating = rating_value(participant)
-            new_rating = old_rating if winner == 0 else calculate_new_rating(old_rating, opponent_average, score)
+            rating_delta = calculate_blended_rating_delta(old_rating, team_average, opponent_average, score)
+            new_rating = old_rating if winner == 0 else old_rating + rating_delta
             player_name = all_names[participant.user_id]
             personal_rows.append(
                 {
@@ -792,6 +807,7 @@ async def write_finish_results(
             )
             player_results.append(
                 PlayerResult(
+                    user_id=participant.user_id,
                     player_name=player_name,
                     team_name=team_name,
                     old_rating=old_rating,
@@ -1005,7 +1021,7 @@ class FinishSelectionView(discord.ui.View):
             return
 
         await interaction.edit_original_response(content="対戦結果を記録しました。", view=self)
-        await interaction.followup.send(embed=create_finish_embed(result))
+        await send_finish_embed(interaction, result)
 
 
 class TieSelect(discord.ui.Select):
@@ -1365,7 +1381,7 @@ async def finish(interaction: discord.Interaction, winner: int) -> None:
         return
 
     await interaction.followup.send("対戦結果を記録しました。", ephemeral=True)
-    await interaction.followup.send(embed=create_finish_embed(result))
+    await send_finish_embed(interaction, result)
 
 
 def main() -> None:
